@@ -1,8 +1,6 @@
 import type { Logg } from '@guiiai/logg'
 import type { Message } from '@xsai/shared-chat'
 
-import type { AiriBridge } from '../../airi/airi-bridge'
-import type { MinecraftContextService } from '../../airi/minecraft-context-service'
 import type { ConversationUpdateEvent } from '../../debug/types'
 import type { Action } from '../../libs/mineflayer/action'
 import type { TaskExecutor } from '../action/task-executor'
@@ -10,11 +8,13 @@ import type { ActionInstruction } from '../action/types'
 import type { EventBus, TracedEvent } from '../event-bus'
 import type { PerceptionSignal } from '../perception/types/signals'
 import type { ReflexManager } from '../reflex/reflex-manager'
-import type { BotEvent, MineflayerWithAgents } from '../types'
+import type { BotEvent, CognitiveBridge, CognitiveContextService, MineflayerWithAgents } from '../types'
 import type { PlannerGlobalDescriptor } from './js-planner'
 import type { LLMAgent, LLMResult } from './llm-agent'
 import type { LlmLogEntry, LlmLogEntryKind } from './llm-log'
 import type { CancellationToken } from './task-state'
+
+import { env } from 'node:process'
 
 import { config } from '../../composables/config'
 import { DebugService } from '../../debug'
@@ -42,8 +42,8 @@ interface BrainDeps {
   logger: Logg
   taskExecutor: TaskExecutor
   reflexManager: ReflexManager
-  airiBridge: AiriBridge
-  minecraftContextService: MinecraftContextService
+  airiBridge: CognitiveBridge
+  minecraftContextService: CognitiveContextService
 }
 
 interface QueuedEvent {
@@ -229,7 +229,15 @@ const EVENT_PRIORITY_NO_ACTION_FOLLOWUP = 3
 const MAX_QUEUED_CONTROL_ACTIONS = 5
 const MAX_PENDING_CONTROL_ACTIONS = 4
 const ACTION_QUEUE_RECENT_HISTORY_LIMIT = 20
-const MAX_CONVERSATION_HISTORY_MESSAGES = 200
+/**
+ * History window sent with every planner call. Once it grows past `BRAIN_HISTORY_MAX` it is cut back to
+ * `BRAIN_HISTORY_KEEP` in one step. Between cuts every request only appends to the previous one, so the
+ * model server can reuse its prompt cache (llama.cpp slot reuse, provider prefix caching); a per-turn cut
+ * shifts the prefix and forces a full re-read of the history on every call.
+ * Unset, both are 200: the upstream behavior (cut to 200 on every turn).
+ */
+const HISTORY_MAX_MESSAGES = positiveIntFromEnv('BRAIN_HISTORY_MAX', 200)
+const HISTORY_KEEP_MESSAGES = Math.min(positiveIntFromEnv('BRAIN_HISTORY_KEEP', HISTORY_MAX_MESSAGES), HISTORY_MAX_MESSAGES)
 const NO_ACTION_FOLLOWUP_BUDGET_DEFAULT = 3
 const NO_ACTION_FOLLOWUP_BUDGET_MAX = 8
 const NO_ACTION_STAGNATION_REPEAT_LIMIT = 2
@@ -240,6 +248,11 @@ const ERROR_BURST_WINDOW_TURNS = 5
 const MAX_EVENT_QUEUE_LENGTH = 256
 const MAX_CONSECUTIVE_HIGH_PRIORITY_TURNS = 8
 const PAUSE_ABORT_ERROR_NAME = 'AbortError'
+
+function positiveIntFromEnv(key: string, fallback: number): number {
+  const parsed = Number(env[key])
+  return Number.isInteger(parsed) && parsed > 0 ? parsed : fallback
+}
 
 /**
  * Turn a cryptic sandbox runtime error into actionable guidance the LLM can act on next turn.
@@ -2067,9 +2080,11 @@ export class Brain {
       } as Message)
 
       // Trim conversation history as an in-memory safety net for long sessions.
-      if (this.conversationHistory.length > MAX_CONVERSATION_HISTORY_MESSAGES) {
-        const trimCount = this.conversationHistory.length - MAX_CONVERSATION_HISTORY_MESSAGES
-        this.conversationHistory = this.conversationHistory.slice(trimCount)
+      if (this.conversationHistory.length > HISTORY_MAX_MESSAGES) {
+        const kept = this.conversationHistory.slice(-HISTORY_KEEP_MESSAGES)
+        // Start on a user turn: chat templates that require alternating roles (Gemma) reject a leading assistant message.
+        const firstUser = kept.findIndex(message => message.role === 'user')
+        this.conversationHistory = firstUser > 0 ? kept.slice(firstUser) : kept
       }
 
       const actionDefs = new Map(this.deps.taskExecutor.getAvailableActions().map(action => [action.name, action]))

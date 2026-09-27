@@ -1,0 +1,6 @@
+{
+  // Standalone (npm) typecheck for the helixus branch: src/airi needs @proj-airi/server-sdk from the
+  // pnpm workspace, which the standalone install does not have. main.ts loads it only in AIRI mode.
+  "extends": "./tsconfig.json",
+  "exclude": ["src/airi/**"]
+}

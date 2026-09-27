@@ -1,23 +1,32 @@
 import process, { exit } from 'node:process'
 
+import type { CognitiveHost } from './cognitive/types'
+
 import MineflayerArmorManager from 'mineflayer-armor-manager'
 
-import { Client } from '@proj-airi/server-sdk'
 import { loader as MineflayerAutoEat } from 'mineflayer-auto-eat'
 import { plugin as MineflayerCollectBlock } from 'mineflayer-collectblock'
 import { pathfinder as MineflayerPathfinder } from 'mineflayer-pathfinder'
 import { plugin as MineflayerPVP } from 'mineflayer-pvp'
 import { plugin as MineflayerTool } from 'mineflayer-tool'
 
-import { startAiriClientConnection } from './airi/start-background-client'
 import { CognitiveEngine } from './cognitive'
 import { config, initEnv } from './composables/config'
 import { MinecraftRuntimeConfigManager } from './composables/runtime-config'
 import { DebugService } from './debug'
 import { setupMineflayerViewer } from './debug/mineflayer-viewer'
+import { HelixusLink } from './helixus/helixus-link'
 import { Mineflayer, wrapPlugin } from './libs/mineflayer'
 import { MinecraftBotRuntime } from './minecraft-bot-runtime'
 import { initLogger, useLogger } from './utils/logger'
+
+/** Shape of `./airi/airi-host`, which is loaded only in AIRI mode (see the NOTICE in `main`). */
+interface AiriHostModule {
+  connectAiriHost: (deps: {
+    logger: ReturnType<typeof useLogger>
+    onConfigure: (config: unknown) => Promise<void>
+  }) => { host: CognitiveHost, close: () => void }
+}
 
 // ...
 
@@ -69,30 +78,37 @@ async function main() {
     DebugService.getInstance().start()
   }
 
-  // Connect airi server
-  let airiConnectionLifecycle: ReturnType<typeof startAiriClientConnection> | null = null
-  const airiClient = new Client({
-    name: config.airi.clientName,
-    url: config.airi.wsBaseUrl,
-    token: config.airi.token || undefined,
-    possibleEvents: ['module:configure', 'module:announced', 'spark:command', 'context:update'],
-    autoConnect: false,
+  // Pick the host the bot reports to and takes commands from.
+  // Helixus live mode (HELIXUS_LINK_PORT set): the AITuberKit page drives the bot through a local HTTP
+  // link and the AIRI server is never contacted. Otherwise: the upstream AIRI server.
+  let host: CognitiveHost
+  let closeHost: () => void
+  const helixusLinkPort = Number(process.env.HELIXUS_LINK_PORT)
+  if (Number.isInteger(helixusLinkPort) && helixusLinkPort > 0) {
+    const helixusLink = new HelixusLink({
+      port: helixusLinkPort,
+      allowedOrigins: (process.env.HELIXUS_ALLOWED_ORIGINS || 'http://localhost:3000,http://127.0.0.1:3000')
+        .split(',')
+        .map(origin => origin.trim())
+        .filter(Boolean),
+    })
+    await helixusLink.start()
+    host = helixusLink
+    closeHost = () => void helixusLink.stop()
+  }
+  else {
     // NOTICE:
-    // The bot's Node event loop occasionally goes quiet for ~30s (busy mineflayer packet handling /
-    // perception ticks), during which the heartbeat ping timer can't fire, so the default 30s
-    // readTimeout would trip and tear down the AIRI connection — making the in-game bot flap
-    // online/offline and the desktop's game-command relay unusable. Widen the read tolerance to 120s
-    // (still under the server's 60s-per-miss TTL for a single ~30s gap) and keep pings frequent so
-    // the connection recovers immediately once the loop frees up.
-    // Root cause (the periodic event-loop stall itself) is tracked separately.
-    heartbeat: { readTimeout: 120_000, pingInterval: 20_000 },
-    onError: error => airiConnectionLifecycle?.reportUnavailable(error),
-    onClose: () => airiConnectionLifecycle?.reportDisconnected(),
-  })
-  airiConnectionLifecycle = startAiriClientConnection(airiClient, {
-    logger,
-    url: config.airi.wsBaseUrl,
-  })
+    // The AIRI host needs @proj-airi/server-sdk, which exists only inside the pnpm workspace
+    // (its dependency @proj-airi/better-ws is not published to npm). The helixus branch installs this
+    // module standalone with npm, so the AIRI host is loaded only when it is used, and through a
+    // non-literal specifier so a standalone typecheck does not pull the AIRI files in.
+    // Removal condition: server-sdk and all its dependencies are installable from npm.
+    const airiHostModule: string = './airi/airi-host'
+    const { connectAiriHost } = await import(airiHostModule) as AiriHostModule
+    const airi = connectAiriHost({ logger, onConfigure: nextConfig => applyConfiguredRuntime(nextConfig) })
+    host = airi.host
+    closeHost = airi.close
+  }
 
   let activeRuntime: MinecraftBotRuntime | null = null
   let viewerInitialized = false
@@ -127,7 +143,7 @@ async function main() {
           viewerInitialized = true
         }
 
-        await bot.loadPlugin(CognitiveEngine({ airiClient }))
+        await bot.loadPlugin(CognitiveEngine({ host }))
 
         // Setup Tool Executor for Debug Dashboard
         const { setupToolExecutor } = await import('./debug/tool-executor')
@@ -169,16 +185,6 @@ async function main() {
     await activeRuntime.updateBotConfig(runtimeSnapshot.effectiveBotConfig)
   }
 
-  airiClient.onEvent('module:configure', async (event) => {
-    try {
-      await applyConfiguredRuntime(event.data.config)
-    }
-    catch {
-      // Keep failures local to the service process. Stage learns only from registry liveness
-      // and explicit bot-originated context pushes, not automated configure updates.
-    }
-  })
-
   if (runtimeSnapshot.editableConfig.enabled) {
     await ensureManagedBot()
   }
@@ -189,10 +195,7 @@ async function main() {
         logger.errorWithError('Failed to stop Minecraft runtime cleanly', err)
       })
       .finally(() => {
-        // TODO: Add an explicit AIRI-side deregistration path on shutdown instead of relying on
-        // websocket close / heartbeat expiry. Right now the Minecraft page can briefly sit in a
-        // stale state after the bot exits, which is annoying and easy to misread as still online.
-        airiClient.close()
+        closeHost()
         exit(0)
       })
   })

@@ -1,14 +1,41 @@
-import type { Client } from '@proj-airi/server-sdk'
-
 import type { Mineflayer } from '../../libs/mineflayer'
+import type { Brain } from '../conscious/brain'
+import type { EventBus } from '../event-bus'
 import type { ReflexManager } from '../reflex/reflex-manager'
 
 export interface MineflayerWithAgents extends Mineflayer {
   reflexManager: ReflexManager
 }
 
+/**
+ * The part of the host seam that the brain talks to: the `notifyAiri` / `updateAiriContext` planner tools.
+ * Implemented by the AIRI server bridge and by the Helixus live link.
+ */
+export interface CognitiveBridge {
+  init: () => void
+  destroy: () => void
+  sendNotify: (headline: string, note?: string, urgency?: 'immediate' | 'soon' | 'later') => void
+  sendContextUpdate: (text: string, hints?: string[], lane?: string) => void
+}
+
+/** Follows the Mineflayer runtime lifecycle so the host can report bot status. */
+export interface CognitiveContextService {
+  init: () => void
+  destroy: () => void
+  bindBot: (bot: MineflayerWithAgents) => void
+  unbindBot: () => void
+}
+
+/**
+ * Where the bot reports to and takes commands from: the AIRI server, or Helixus's live page.
+ * It outlives one bot runtime: the engine attaches each rebuilt runtime (event bus, brain) after a reconnect.
+ */
+export interface CognitiveHost extends CognitiveBridge, CognitiveContextService {
+  attachRuntime: (runtime: { eventBus: EventBus, brain: Brain }) => void
+}
+
 export interface CognitiveEngineOptions {
-  airiClient: Client
+  host: CognitiveHost
 }
 
 // TODO: currently stimulus is just chat events, consider renaming to 'input' or 'user_interaction'

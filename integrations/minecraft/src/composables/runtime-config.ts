@@ -138,13 +138,16 @@ export class MinecraftRuntimeConfigManager {
       username: resolveString('BOT_USERNAME', savedConfig.username, envConfig.BOT_USERNAME, undefined, 'airi-bot'),
     })
 
+    // `auto` lets mineflayer ping the server and pick its version (LAN worlds change version with the client).
+    const version = resolveString('BOT_VERSION', undefined, envConfig.BOT_VERSION, localEnvConfig.BOT_VERSION, '1.20')
+
     return {
       editableConfig,
       effectiveBotConfig: {
         host: resolveString('BOT_HOSTNAME', savedConfig.host, envConfig.BOT_HOSTNAME, localEnvConfig.BOT_HOSTNAME, 'localhost'),
         port: resolvePort('BOT_PORT', savedConfig.port, envConfig.BOT_PORT, localEnvConfig.BOT_PORT, 25565),
         username: resolveString('BOT_USERNAME', savedConfig.username, envConfig.BOT_USERNAME, localEnvConfig.BOT_USERNAME, 'airi-bot'),
-        version: resolveString('BOT_VERSION', undefined, envConfig.BOT_VERSION, localEnvConfig.BOT_VERSION, '1.20'),
+        version: version.toLowerCase() === 'auto' ? undefined : version,
         auth: (normalizeOptionalString(localEnvConfig.BOT_AUTH)
           ?? normalizeOptionalString(envConfig.BOT_AUTH)
           ?? normalizeOptionalString(process.env.BOT_AUTH)) as Config['bot']['auth'] | undefined,
